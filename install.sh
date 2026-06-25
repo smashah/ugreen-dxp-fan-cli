@@ -7,6 +7,9 @@ ENABLE_SERVICE=1
 START_NOW=1
 WRITE_MODULE_CONFIG=1
 DISABLE_EMPTY_FANCONTROL=1
+GRAPH_ENABLED=1
+GRAPH_INTERVAL_SEC=10
+HISTORY_FILE="/var/lib/ugreen-fan/history.tsv"
 RAW_BASE_URL="${UGREEN_FAN_RAW_BASE_URL:-https://raw.githubusercontent.com/smashah/ugreen-dxp-fan-cli/main}"
 
 usage() {
@@ -20,6 +23,8 @@ Options:
   --no-start           Do not apply auto mode immediately.
   --no-module-config   Do not write it87 modprobe/modules-load config.
   --keep-fancontrol    Do not disable fancontrol even if it has no config.
+  --no-graph           Do not enable graph history collection.
+  --graph-interval 10  Graph collection interval in seconds. Default: 10.
   -h, --help           Show this help.
 
 This installer does not install the out-of-tree it87 driver. Install/load that
@@ -59,6 +64,15 @@ while [ "$#" -gt 0 ]; do
       DISABLE_EMPTY_FANCONTROL=0
       shift
       ;;
+    --no-graph)
+      GRAPH_ENABLED=0
+      shift
+      ;;
+    --graph-interval)
+      [ "$#" -ge 2 ] || die "--graph-interval requires a value"
+      GRAPH_INTERVAL_SEC="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -71,6 +85,8 @@ done
 
 [[ "$TARGET_C" =~ ^[0-9]+$ ]] || die "--target must be a number"
 [ "$TARGET_C" -ge 20 ] && [ "$TARGET_C" -le 85 ] || die "--target must be from 20 to 85"
+[[ "$GRAPH_INTERVAL_SEC" =~ ^[0-9]+$ ]] || die "--graph-interval must be a number"
+[ "$GRAPH_INTERVAL_SEC" -ge 5 ] && [ "$GRAPH_INTERVAL_SEC" -le 3600 ] || die "--graph-interval must be from 5 to 3600"
 
 [ "$(id -u)" -eq 0 ] || die "run as root, for example with sudo"
 command -v install >/dev/null 2>&1 || die "install command not found"
@@ -96,6 +112,17 @@ download() {
   fi
 }
 
+set_config_key() {
+  local key="$1"
+  local value="$2"
+
+  if grep -q "^${key}=" /etc/ugreen-fan.conf; then
+    sed -i "s|^${key}=.*|${key}=${value}|" /etc/ugreen-fan.conf
+  else
+    printf '%s=%s\n' "$key" "$value" >> /etc/ugreen-fan.conf
+  fi
+}
+
 if [ -f "$SCRIPT_DIR/fan" ]; then
   FAN_SOURCE="$SCRIPT_DIR/fan"
 else
@@ -117,17 +144,19 @@ if [ ! -f /etc/ugreen-fan.conf ]; then
 # AUTO_TARGET_C is used by 'fan auto' and ugreen-fan-auto.service at boot.
 AUTO_TARGET_C=$TARGET_C
 CHANNELS="pwm2 pwm3"
+GRAPH_ENABLED=$GRAPH_ENABLED
+GRAPH_INTERVAL_SEC=$GRAPH_INTERVAL_SEC
+HISTORY_FILE="$HISTORY_FILE"
 EOF
   chmod 0644 /etc/ugreen-fan.conf
 else
-  if grep -q '^AUTO_TARGET_C=' /etc/ugreen-fan.conf; then
-    sed -i "s/^AUTO_TARGET_C=.*/AUTO_TARGET_C=$TARGET_C/" /etc/ugreen-fan.conf
-  else
-    printf 'AUTO_TARGET_C=%s\n' "$TARGET_C" >> /etc/ugreen-fan.conf
-  fi
+  set_config_key AUTO_TARGET_C "$TARGET_C"
   if ! grep -q '^CHANNELS=' /etc/ugreen-fan.conf; then
     printf '%s\n' 'CHANNELS="pwm2 pwm3"' >> /etc/ugreen-fan.conf
   fi
+  set_config_key GRAPH_ENABLED "$GRAPH_ENABLED"
+  set_config_key GRAPH_INTERVAL_SEC "$GRAPH_INTERVAL_SEC"
+  set_config_key HISTORY_FILE "\"$HISTORY_FILE\""
 fi
 
 if [ "$WRITE_MODULE_CONFIG" -eq 1 ]; then
@@ -161,6 +190,35 @@ ExecStart=/usr/local/bin/fan auto
 WantedBy=multi-user.target
 EOF
 
+info "Writing graph collection service"
+cat > /etc/systemd/system/ugreen-fan-graph.service <<'EOF'
+[Unit]
+Description=Collect UGREEN DXP fan and temperature graph sample
+After=systemd-modules-load.service
+ConditionPathExists=/usr/local/bin/fan
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/local/bin/fan graph collect
+EOF
+
+cat > /etc/systemd/system/ugreen-fan-graph.timer <<EOF
+[Unit]
+Description=Collect UGREEN DXP fan and temperature graph history
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=${GRAPH_INTERVAL_SEC}s
+AccuracySec=1s
+Persistent=false
+Unit=ugreen-fan-graph.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
 
 if [ "$DISABLE_EMPTY_FANCONTROL" -eq 1 ] &&
@@ -177,11 +235,20 @@ fi
 if [ "$ENABLE_SERVICE" -eq 1 ]; then
   info "Enabling ugreen-fan-auto.service"
   systemctl enable ugreen-fan-auto.service >/dev/null
+  if [ "$GRAPH_ENABLED" -eq 1 ]; then
+    info "Enabling ugreen-fan-graph.timer"
+    systemctl enable ugreen-fan-graph.timer >/dev/null
+  fi
 fi
 
 if [ "$START_NOW" -eq 1 ]; then
   info "Applying auto mode now"
   systemctl start ugreen-fan-auto.service
+  if [ "$GRAPH_ENABLED" -eq 1 ]; then
+    info "Starting graph collection"
+    systemctl restart ugreen-fan-graph.timer
+    systemctl start ugreen-fan-graph.service >/dev/null 2>&1 || true
+  fi
 fi
 
 info "Installed. Try: fan status"

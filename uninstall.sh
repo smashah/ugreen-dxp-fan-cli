@@ -37,7 +37,10 @@ done
 [ "$(id -u)" -eq 0 ] || die "run as root, for example with sudo"
 
 if command -v systemctl >/dev/null 2>&1; then
+  systemctl disable --now ugreen-fan-graph.timer >/dev/null 2>&1 || true
   systemctl disable --now ugreen-fan-auto.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/ugreen-fan-graph.timer
+  rm -f /etc/systemd/system/ugreen-fan-graph.service
   rm -f /etc/systemd/system/ugreen-fan-auto.service
   systemctl daemon-reload || true
 fi
@@ -46,6 +49,7 @@ rm -f /usr/local/bin/fan /usr/local/sbin/ugreen-fan-mode
 
 if [ "$KEEP_CONFIG" -eq 0 ]; then
   rm -f /etc/ugreen-fan.conf /etc/modules-load.d/it87.conf /etc/modprobe.d/it87.conf
+  rm -rf /var/lib/ugreen-fan
 fi
 
 printf '%s\n' 'Uninstalled ugreen-dxp-fan-cli.'

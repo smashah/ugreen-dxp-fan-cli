@@ -7,6 +7,10 @@ CONFIG_FILE="${UGREEN_FAN_CONFIG:-$DEFAULT_CONFIG_FILE}"
 LOCK_FILE="${UGREEN_FAN_LOCK:-/run/ugreen-fan.lock}"
 DEFAULT_TARGET_C=35
 DEFAULT_CHANNELS="pwm2 pwm3"
+DEFAULT_HISTORY_FILE="/var/lib/ugreen-fan/history.tsv"
+DEFAULT_GRAPH_ENABLED=1
+DEFAULT_GRAPH_INTERVAL_SEC=10
+GRAPH_RETENTION_SEC=86400
 
 usage() {
   cat <<'EOF'
@@ -22,6 +26,11 @@ Usage:
   fan 50%
   fan manual 128
   fan off --yes
+  fan graph
+  fan graph status
+  fan graph on
+  fan graph off
+  fan graph interval 30
 
 Modes:
   auto        Apply the saved hardware auto fan curve.
@@ -30,6 +39,7 @@ Modes:
   255         Set a raw manual PWM value from 0 to 255.
   50%         Set a manual percentage from 0% to 100%.
   off --yes   Set manual PWM 0. This can overheat the NAS.
+  graph       Show the last 24h of collected fan and temperature history.
 
 Config:
   /etc/ugreen-fan.conf
@@ -50,18 +60,31 @@ warn() {
 load_config() {
   AUTO_TARGET_C="$DEFAULT_TARGET_C"
   CHANNELS="$DEFAULT_CHANNELS"
+  HISTORY_FILE="$DEFAULT_HISTORY_FILE"
+  GRAPH_ENABLED="$DEFAULT_GRAPH_ENABLED"
+  GRAPH_INTERVAL_SEC="$DEFAULT_GRAPH_INTERVAL_SEC"
 
   if [ -f "$CONFIG_FILE" ]; then
     # shellcheck source=/dev/null
     . "$CONFIG_FILE"
   fi
 
+  HISTORY_FILE="${UGREEN_FAN_HISTORY:-$HISTORY_FILE}"
+
   validate_target "$AUTO_TARGET_C"
   validate_channels "$CHANNELS"
+  validate_graph_enabled "$GRAPH_ENABLED"
+  validate_graph_interval "$GRAPH_INTERVAL_SEC"
 }
 
 save_config() {
   local target_c="$1"
+
+  AUTO_TARGET_C="$target_c"
+  save_config_all
+}
+
+save_config_all() {
   local dir tmp
 
   dir="$(dirname "$CONFIG_FILE")"
@@ -70,8 +93,12 @@ save_config() {
   {
     printf '%s\n' '# UGREEN DXP fan CLI config'
     printf '%s\n' "# AUTO_TARGET_C is used by 'fan auto' and ugreen-fan-auto.service at boot."
-    printf 'AUTO_TARGET_C=%s\n' "$target_c"
+    printf 'AUTO_TARGET_C=%s\n' "$AUTO_TARGET_C"
     printf 'CHANNELS=%q\n' "$CHANNELS"
+    printf '%s\n' "# Graph history is collected by ugreen-fan-graph.timer."
+    printf 'GRAPH_ENABLED=%s\n' "$GRAPH_ENABLED"
+    printf 'GRAPH_INTERVAL_SEC=%s\n' "$GRAPH_INTERVAL_SEC"
+    printf 'HISTORY_FILE=%q\n' "$HISTORY_FILE"
   } > "$tmp"
   chmod 0644 "$tmp"
   mv "$tmp" "$CONFIG_FILE"
@@ -106,6 +133,29 @@ validate_channels() {
       *) die "invalid channel name in CHANNELS: $channel" ;;
     esac
   done
+}
+
+validate_graph_enabled() {
+  case "$1" in
+    0|1) ;;
+    *) die "GRAPH_ENABLED must be 0 or 1" ;;
+  esac
+}
+
+validate_graph_interval() {
+  local interval="$1"
+
+  [[ "$interval" =~ ^[0-9]+$ ]] || die "graph interval must be a number of seconds"
+  [ "$interval" -ge 5 ] && [ "$interval" -le 3600 ] || die "graph interval must be from 5 to 3600 seconds"
+}
+
+interval_arg_to_sec() {
+  local arg="$1"
+
+  arg="${arg%s}"
+  arg="${arg%sec}"
+  validate_graph_interval "$arg"
+  printf '%s\n' "$arg"
 }
 
 percent_to_pwm() {
@@ -189,8 +239,28 @@ write_if_exists() {
   printf '%s\n' "$value" > "$path"
 }
 
+current_epoch() {
+  if [ -n "${UGREEN_FAN_NOW:-}" ]; then
+    printf '%s\n' "$UGREEN_FAN_NOW"
+  else
+    date +%s
+  fi
+}
+
 require_root_for_write() {
   if [ "$(id -u)" -ne 0 ] && [ -z "${UGREEN_FAN_HWMON:-}" ]; then
+    die "run as root, for example with sudo"
+  fi
+}
+
+require_root_for_graph_config() {
+  if [ "$(id -u)" -ne 0 ] && [ -z "${UGREEN_FAN_CONFIG:-}" ]; then
+    die "run as root, for example with sudo"
+  fi
+}
+
+require_history_write() {
+  if [ "$(id -u)" -ne 0 ] && [ -z "${UGREEN_FAN_HISTORY:-}" ]; then
     die "run as root, for example with sudo"
   fi
 }
@@ -205,17 +275,6 @@ check_channels_exist() {
   done
 }
 
-mode_for_enable() {
-  local enable="$1"
-
-  case "$enable" in
-    0) printf 'full' ;;
-    1) printf 'manual' ;;
-    2) printf 'auto' ;;
-    *) printf 'unknown' ;;
-  esac
-}
-
 print_auto_attr() {
   local hwmon="$1"
   local channel="$2"
@@ -226,6 +285,282 @@ print_auto_attr() {
     [ -e "$path" ] || continue
     printf '%-28s %s\n' "${channel}_${name}" "$(read_attr "$path")"
   done
+}
+
+prune_graph_history() {
+  local epoch="$1"
+  local cutoff dir tmp
+
+  [ -f "$HISTORY_FILE" ] || return 0
+
+  cutoff=$((epoch - GRAPH_RETENTION_SEC))
+  dir="$(dirname "$HISTORY_FILE")"
+  tmp="$(mktemp "$dir/.history.XXXXXX")"
+  awk -v cutoff="$cutoff" '
+    BEGIN { FS = "\t"; OFS = "\t" }
+    $1 ~ /^[0-9]+$/ && $1 >= cutoff { print }
+  ' "$HISTORY_FILE" > "$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$HISTORY_FILE"
+}
+
+collect_graph_sample() {
+  local hwmon="$1"
+  local epoch dir file label value
+
+  [ "$GRAPH_ENABLED" -eq 1 ] || exit 0
+
+  require_history_write
+  dir="$(dirname "$HISTORY_FILE")"
+  mkdir -p "$dir"
+
+  epoch="$(current_epoch)"
+  {
+    printf '%s' "$epoch"
+    for file in "$hwmon"/fan*_input "$hwmon"/temp*_input; do
+      [ -e "$file" ] || continue
+      label="$(basename "$file" _input)"
+      value="$(read_attr "$file")"
+      case "$value" in
+        ''|*[!0-9-]*) continue ;;
+      esac
+      printf '\t%s=%s' "$label" "$value"
+    done
+    printf '\n'
+  } >> "$HISTORY_FILE"
+
+  prune_graph_history "$epoch"
+  chmod 0644 "$HISTORY_FILE" 2>/dev/null || true
+  printf 'collected graph sample at %s\n' "$epoch"
+}
+
+print_graph() {
+  local now width
+
+  now="$(current_epoch)"
+  width="${UGREEN_FAN_GRAPH_WIDTH:-72}"
+  [[ "$width" =~ ^[0-9]+$ ]] || die "UGREEN_FAN_GRAPH_WIDTH must be a number"
+  [ "$width" -ge 20 ] && [ "$width" -le 160 ] || die "graph width must be from 20 to 160"
+
+  [ -s "$HISTORY_FILE" ] || die "no graph history yet. Check 'fan graph status' or wait for the timer to collect samples."
+
+  printf 'fan graph: last 24h, %ss poll interval, history %s\n' "$GRAPH_INTERVAL_SEC" "$HISTORY_FILE"
+  awk -v now="$now" -v retention="$GRAPH_RETENTION_SEC" -v width="$width" '
+    BEGIN {
+      FS = "\t"
+      palette = " .:-=+*#%@"
+      plen = length(palette)
+      since = now - retention
+    }
+    $1 !~ /^[0-9]+$/ { next }
+    $1 < since { next }
+    {
+      rows++
+      epoch = $1 + 0
+      if (epoch > max_epoch) {
+        max_epoch = epoch
+      }
+      bin = int((epoch - since) * width / retention)
+      if (bin < 0) {
+        bin = 0
+      }
+      if (bin >= width) {
+        bin = width - 1
+      }
+
+      for (i = 2; i <= NF; i++) {
+        split($i, kv, "=")
+        key = kv[1]
+        val = kv[2] + 0
+        if (key !~ /^(fan|temp)[0-9]+$/) {
+          continue
+        }
+        if (key ~ /^temp/) {
+          val = val / 1000
+        }
+        if (!(key in seen)) {
+          seen[key] = 1
+          keys[++nkeys] = key
+          min[key] = val
+          max[key] = val
+        }
+        if (val < min[key]) {
+          min[key] = val
+        }
+        if (val > max[key]) {
+          max[key] = val
+        }
+        id = key SUBSEP bin
+        sum[id] += val
+        count[id]++
+        latest[key] = val
+      }
+    }
+    END {
+      if (rows == 0) {
+        print "no graph data for the last 24h"
+        exit 2
+      }
+      printf "samples: %d, latest age: %ds\n\n", rows, now - max_epoch
+      printf "%-6s %10s %-4s %10s %10s  %s\n", "series", "latest", "unit", "min", "max", "trend"
+      for (k = 1; k <= nkeys; k++) {
+        key = keys[k]
+        unit = (key ~ /^temp/) ? "C" : "RPM"
+        printf "%-6s %10.1f %-4s %10.1f %10.1f  |", key, latest[key], unit, min[key], max[key]
+        for (b = 0; b < width; b++) {
+          id = key SUBSEP b
+          if (!(id in count)) {
+            printf " "
+            continue
+          }
+          val = sum[id] / count[id]
+          if (max[key] == min[key]) {
+            idx = plen
+          } else {
+            idx = int((val - min[key]) * (plen - 1) / (max[key] - min[key])) + 1
+          }
+          if (idx < 1) {
+            idx = 1
+          }
+          if (idx > plen) {
+            idx = plen
+          }
+          printf "%s", substr(palette, idx, 1)
+        }
+        printf "|\n"
+      }
+    }
+  ' "$HISTORY_FILE"
+}
+
+graph_history_summary() {
+  local now
+
+  now="$(current_epoch)"
+  if [ ! -s "$HISTORY_FILE" ]; then
+    printf 'samples: 0\n'
+    return 0
+  fi
+
+  awk -v now="$now" -v retention="$GRAPH_RETENTION_SEC" '
+    BEGIN { FS = "\t"; since = now - retention }
+    $1 ~ /^[0-9]+$/ && $1 >= since {
+      rows++
+      if (first == 0 || $1 < first) {
+        first = $1
+      }
+      if ($1 > last) {
+        last = $1
+      }
+    }
+    END {
+      printf "samples: %d\n", rows
+      if (rows > 0) {
+        printf "oldest_age_sec: %d\n", now - first
+        printf "latest_age_sec: %d\n", now - last
+      }
+    }
+  ' "$HISTORY_FILE"
+}
+
+write_graph_units() {
+  require_root_for_graph_config
+  command -v systemctl >/dev/null 2>&1 || die "systemctl not found"
+
+  cat > /etc/systemd/system/ugreen-fan-graph.service <<'EOF'
+[Unit]
+Description=Collect UGREEN DXP fan and temperature graph sample
+After=systemd-modules-load.service
+ConditionPathExists=/usr/local/bin/fan
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/local/bin/fan graph collect
+EOF
+
+  cat > /etc/systemd/system/ugreen-fan-graph.timer <<EOF
+[Unit]
+Description=Collect UGREEN DXP fan and temperature graph history
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=${GRAPH_INTERVAL_SEC}s
+AccuracySec=1s
+Persistent=false
+Unit=ugreen-fan-graph.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+}
+
+graph_status() {
+  printf 'enabled: %s\n' "$GRAPH_ENABLED"
+  printf 'interval_sec: %s\n' "$GRAPH_INTERVAL_SEC"
+  printf 'retention_sec: %s\n' "$GRAPH_RETENTION_SEC"
+  printf 'history: %s\n' "$HISTORY_FILE"
+  graph_history_summary
+
+  if command -v systemctl >/dev/null 2>&1; then
+    printf 'timer_enabled: %s\n' "$(systemctl is-enabled ugreen-fan-graph.timer 2>/dev/null || true)"
+    printf 'timer_active: %s\n' "$(systemctl is-active ugreen-fan-graph.timer 2>/dev/null || true)"
+  fi
+}
+
+handle_graph() {
+  local subcommand="${1:-show}"
+  local value="${2:-}"
+  local hwmon
+
+  case "$subcommand" in
+    show|"")
+      print_graph
+      ;;
+    status)
+      graph_status
+      ;;
+    collect)
+      hwmon="$(find_hwmon)"
+      collect_graph_sample "$hwmon"
+      ;;
+    on|enable)
+      require_root_for_graph_config
+      GRAPH_ENABLED=1
+      save_config_all
+      write_graph_units
+      systemctl enable --now ugreen-fan-graph.timer >/dev/null
+      systemctl start ugreen-fan-graph.service >/dev/null 2>&1 || true
+      graph_status
+      ;;
+    off|disable)
+      require_root_for_graph_config
+      GRAPH_ENABLED=0
+      save_config_all
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now ugreen-fan-graph.timer >/dev/null 2>&1 || true
+      fi
+      graph_status
+      ;;
+    interval)
+      [ -n "$value" ] || die "usage: fan graph interval <seconds>"
+      require_root_for_graph_config
+      GRAPH_INTERVAL_SEC="$(interval_arg_to_sec "$value")"
+      save_config_all
+      write_graph_units
+      if [ "$GRAPH_ENABLED" -eq 1 ]; then
+        systemctl enable --now ugreen-fan-graph.timer >/dev/null
+        systemctl restart ugreen-fan-graph.timer >/dev/null
+      fi
+      graph_status
+      ;;
+    *)
+      die "unknown graph command: $subcommand"
+      ;;
+  esac
 }
 
 status() {
@@ -363,6 +698,12 @@ main() {
       exit 0
       ;;
   esac
+
+  if [ "$command" = "graph" ]; then
+    shift || true
+    handle_graph "$@"
+    exit 0
+  fi
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
