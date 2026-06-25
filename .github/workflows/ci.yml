@@ -11,6 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Syntax check
-        run: bash -n fan install.sh uninstall.sh tests/smoke.sh
+        run: bash -n fan install.sh uninstall.sh tests/smoke.sh tests/install.sh
       - name: Smoke test
         run: bash tests/smoke.sh
+      - name: Install test
+        run: bash tests/install.sh

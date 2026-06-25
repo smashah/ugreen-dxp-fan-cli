@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PREFIX="/usr/local"
+PREFIX="${UGREEN_FAN_PREFIX:-/usr/local}"
+ETC_DIR="${UGREEN_FAN_ETC_DIR:-/etc}"
+CONFIG_FILE="${UGREEN_FAN_CONFIG:-$ETC_DIR/ugreen-fan.conf}"
+SYSTEMD_DIR="${UGREEN_FAN_SYSTEMD_DIR:-$ETC_DIR/systemd/system}"
+MODULES_LOAD_DIR="${UGREEN_FAN_MODULES_LOAD_DIR:-$ETC_DIR/modules-load.d}"
+MODPROBE_DIR="${UGREEN_FAN_MODPROBE_DIR:-$ETC_DIR/modprobe.d}"
+VAR_LIB_DIR="${UGREEN_FAN_VAR_LIB_DIR:-/var/lib/ugreen-fan}"
+HISTORY_FILE="${UGREEN_FAN_HISTORY:-$VAR_LIB_DIR/history.tsv}"
+SERVICE_FAN_BIN="${UGREEN_FAN_SERVICE_BIN:-$PREFIX/bin/fan}"
 TARGET_C=35
 ENABLE_SERVICE=1
 START_NOW=1
@@ -9,7 +17,6 @@ WRITE_MODULE_CONFIG=1
 DISABLE_EMPTY_FANCONTROL=1
 GRAPH_ENABLED=1
 GRAPH_INTERVAL_SEC=10
-HISTORY_FILE="/var/lib/ugreen-fan/history.tsv"
 RAW_BASE_URL="${UGREEN_FAN_RAW_BASE_URL:-https://raw.githubusercontent.com/smashah/ugreen-dxp-fan-cli/main}"
 
 usage() {
@@ -88,7 +95,9 @@ done
 [[ "$GRAPH_INTERVAL_SEC" =~ ^[0-9]+$ ]] || die "--graph-interval must be a number"
 [ "$GRAPH_INTERVAL_SEC" -ge 5 ] && [ "$GRAPH_INTERVAL_SEC" -le 3600 ] || die "--graph-interval must be from 5 to 3600"
 
-[ "$(id -u)" -eq 0 ] || die "run as root, for example with sudo"
+if [ "$(id -u)" -ne 0 ] && [ "${UGREEN_FAN_ALLOW_NONROOT:-0}" != "1" ]; then
+  die "run as root, for example with sudo"
+fi
 command -v install >/dev/null 2>&1 || die "install command not found"
 command -v systemctl >/dev/null 2>&1 || die "systemctl not found"
 
@@ -116,12 +125,25 @@ download() {
 set_config_key() {
   local key="$1"
   local value="$2"
+  local tmp
 
-  if grep -q "^${key}=" /etc/ugreen-fan.conf; then
-    sed -i "s|^${key}=.*|${key}=${value}|" /etc/ugreen-fan.conf
-  else
-    printf '%s=%s\n' "$key" "$value" >> /etc/ugreen-fan.conf
-  fi
+  tmp="$(mktemp "$(dirname "$CONFIG_FILE")/.ugreen-fan.conf.XXXXXX")"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { found = 0 }
+    index($0, key "=") == 1 {
+      print key "=" value
+      found = 1
+      next
+    }
+    { print }
+    END {
+      if (!found) {
+        print key "=" value
+      }
+    }
+  ' "$CONFIG_FILE" > "$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
 }
 
 if [ -f "$SCRIPT_DIR/fan" ]; then
@@ -138,9 +160,10 @@ install -d "$PREFIX/bin" "$PREFIX/sbin"
 install -m 0755 "$FAN_SOURCE" "$PREFIX/bin/fan"
 ln -sfn "$PREFIX/bin/fan" "$PREFIX/sbin/ugreen-fan-mode"
 
-info "Writing /etc/ugreen-fan.conf"
-if [ ! -f /etc/ugreen-fan.conf ]; then
-  cat > /etc/ugreen-fan.conf <<EOF
+info "Writing $CONFIG_FILE"
+install -d "$(dirname "$CONFIG_FILE")"
+if [ ! -f "$CONFIG_FILE" ]; then
+  cat > "$CONFIG_FILE" <<EOF
 # UGREEN DXP fan CLI config
 # AUTO_TARGET_C is used by 'fan auto' and ugreen-fan-auto.service at boot.
 AUTO_TARGET_C=$TARGET_C
@@ -149,11 +172,11 @@ GRAPH_ENABLED=$GRAPH_ENABLED
 GRAPH_INTERVAL_SEC=$GRAPH_INTERVAL_SEC
 HISTORY_FILE="$HISTORY_FILE"
 EOF
-  chmod 0644 /etc/ugreen-fan.conf
+  chmod 0644 "$CONFIG_FILE"
 else
   set_config_key AUTO_TARGET_C "$TARGET_C"
-  if ! grep -q '^CHANNELS=' /etc/ugreen-fan.conf; then
-    printf '%s\n' 'CHANNELS="pwm2 pwm3"' >> /etc/ugreen-fan.conf
+  if ! grep -q '^CHANNELS=' "$CONFIG_FILE"; then
+    printf '%s\n' 'CHANNELS="pwm2 pwm3"' >> "$CONFIG_FILE"
   fi
   set_config_key GRAPH_ENABLED "$GRAPH_ENABLED"
   set_config_key GRAPH_INTERVAL_SEC "$GRAPH_INTERVAL_SEC"
@@ -162,50 +185,51 @@ fi
 
 if [ "$WRITE_MODULE_CONFIG" -eq 1 ]; then
   info "Writing it87 module config"
-  install -d /etc/modules-load.d /etc/modprobe.d
-  cat > /etc/modules-load.d/it87.conf <<'EOF'
+  install -d "$MODULES_LOAD_DIR" "$MODPROBE_DIR"
+  cat > "$MODULES_LOAD_DIR/it87.conf" <<'EOF'
 # Load UGREEN DXP IT8613E hwmon driver at boot.
 it87
 EOF
-  cat > /etc/modprobe.d/it87.conf <<'EOF'
+  cat > "$MODPROBE_DIR/it87.conf" <<'EOF'
 # UGREEN DXP NAS boards can have ACPI claiming the IT8613E I/O region.
 options it87 ignore_resource_conflict=1
 EOF
 fi
 
 info "Writing systemd service"
-cat > /etc/systemd/system/ugreen-fan-auto.service <<'EOF'
+install -d "$SYSTEMD_DIR"
+cat > "$SYSTEMD_DIR/ugreen-fan-auto.service" <<EOF
 [Unit]
 Description=Apply UGREEN DXP automatic fan curve
 After=systemd-modules-load.service coolercontrold.service
 Before=fancontrol.service
-ConditionPathExists=/usr/local/bin/fan
+ConditionPathExists=$SERVICE_FAN_BIN
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStartPre=/bin/sh -c 'command -v modprobe >/dev/null 2>&1 && modprobe it87 ignore_resource_conflict=1 || true'
-ExecStart=/usr/local/bin/fan auto
+ExecStart=$SERVICE_FAN_BIN auto
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 info "Writing graph collection service"
-cat > /etc/systemd/system/ugreen-fan-graph.service <<'EOF'
+cat > "$SYSTEMD_DIR/ugreen-fan-graph.service" <<EOF
 [Unit]
 Description=Collect UGREEN DXP fan and temperature graph sample
 After=systemd-modules-load.service
-ConditionPathExists=/usr/local/bin/fan
+ConditionPathExists=$SERVICE_FAN_BIN
 
 [Service]
 Type=oneshot
 Nice=10
 IOSchedulingClass=idle
-ExecStart=/usr/local/bin/fan graph collect
+ExecStart=$SERVICE_FAN_BIN graph collect
 EOF
 
-cat > /etc/systemd/system/ugreen-fan-graph.timer <<EOF
+cat > "$SYSTEMD_DIR/ugreen-fan-graph.timer" <<EOF
 [Unit]
 Description=Collect UGREEN DXP fan and temperature graph history
 
@@ -224,7 +248,7 @@ systemctl daemon-reload
 
 if [ "$DISABLE_EMPTY_FANCONTROL" -eq 1 ] &&
    systemctl list-unit-files fancontrol.service >/dev/null 2>&1 &&
-   [ ! -s /etc/fancontrol ]; then
+   [ ! -s "$ETC_DIR/fancontrol" ]; then
   info "Disabling empty fancontrol.service"
   systemctl disable --now fancontrol.service >/dev/null 2>&1 || true
 fi

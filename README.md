@@ -180,8 +180,9 @@ sudo ./uninstall.sh --keep-config
 Run syntax checks and the fake-hwmon smoke test:
 
 ```sh
-bash -n fan install.sh uninstall.sh tests/smoke.sh
+bash -n fan install.sh uninstall.sh tests/smoke.sh tests/install.sh
 bash tests/smoke.sh
+bash tests/install.sh
 ```
 
 ## Safety

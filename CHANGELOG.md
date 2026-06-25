@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+- Add install/uninstall smoke tests that run against a temporary root with fake `systemctl`.
+- Add test-only installer path overrides so CI can verify generated files and service commands without touching the host.
+- Cover stdin/one-line install mode in tests.
+
 ## 0.2.1
 
 - Fix one-line installer warning when run through `curl | bash`.
