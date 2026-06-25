@@ -7,6 +7,7 @@ ENABLE_SERVICE=1
 START_NOW=1
 WRITE_MODULE_CONFIG=1
 DISABLE_EMPTY_FANCONTROL=1
+RAW_BASE_URL="${UGREEN_FAN_RAW_BASE_URL:-https://raw.githubusercontent.com/smashah/ugreen-dxp-fan-cli/main}"
 
 usage() {
   cat <<'EOF'
@@ -76,11 +77,37 @@ command -v install >/dev/null 2>&1 || die "install command not found"
 command -v systemctl >/dev/null 2>&1 || die "systemctl not found"
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-[ -f "$SCRIPT_DIR/fan" ] || die "fan script not found next to installer"
+TMP_DIR=""
+cleanup() {
+  [ -z "$TMP_DIR" ] || rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+download() {
+  local url="$1"
+  local output="$2"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$output"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$output" "$url"
+  else
+    die "curl or wget is required for one-line install"
+  fi
+}
+
+if [ -f "$SCRIPT_DIR/fan" ]; then
+  FAN_SOURCE="$SCRIPT_DIR/fan"
+else
+  info "Downloading fan CLI"
+  TMP_DIR="$(mktemp -d)"
+  FAN_SOURCE="$TMP_DIR/fan"
+  download "$RAW_BASE_URL/fan" "$FAN_SOURCE"
+fi
 
 info "Installing fan CLI"
 install -d "$PREFIX/bin" "$PREFIX/sbin"
-install -m 0755 "$SCRIPT_DIR/fan" "$PREFIX/bin/fan"
+install -m 0755 "$FAN_SOURCE" "$PREFIX/bin/fan"
 ln -sfn "$PREFIX/bin/fan" "$PREFIX/sbin/ugreen-fan-mode"
 
 info "Writing /etc/ugreen-fan.conf"
