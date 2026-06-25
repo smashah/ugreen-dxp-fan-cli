@@ -92,7 +92,8 @@ done
 command -v install >/dev/null 2>&1 || die "install command not found"
 command -v systemctl >/dev/null 2>&1 || die "systemctl not found"
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd)"
 TMP_DIR=""
 cleanup() {
   [ -z "$TMP_DIR" ] || rm -rf "$TMP_DIR"
@@ -243,7 +244,7 @@ fi
 
 if [ "$START_NOW" -eq 1 ]; then
   info "Applying auto mode now"
-  systemctl start ugreen-fan-auto.service
+  systemctl restart ugreen-fan-auto.service
   if [ "$GRAPH_ENABLED" -eq 1 ]; then
     info "Starting graph collection"
     systemctl restart ugreen-fan-graph.timer

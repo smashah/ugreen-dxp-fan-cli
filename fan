@@ -324,6 +324,9 @@ collect_graph_sample() {
       case "$value" in
         ''|*[!0-9-]*) continue ;;
       esac
+      if [ "${label#temp}" != "$label" ] && { [ "$value" -lt -40000 ] || [ "$value" -gt 125000 ]; }; then
+        continue
+      fi
       printf '\t%s=%s' "$label" "$value"
     done
     printf '\n'

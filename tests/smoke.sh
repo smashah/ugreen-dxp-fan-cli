@@ -26,6 +26,7 @@ for n in 2 3; do
 done
 printf '%s\n' 49000 > "$HWMON/temp1_input"
 printf '%s\n' 37000 > "$HWMON/temp2_input"
+printf '%s\n' -128000 > "$HWMON/temp3_input"
 
 export UGREEN_FAN_HWMON="$HWMON"
 export UGREEN_FAN_CONFIG="$CONF"
@@ -64,11 +65,16 @@ fi
 export UGREEN_FAN_NOW=100
 "$ROOT_DIR/fan" graph collect >/dev/null
 grep -q '^100	' "$HISTORY"
+if grep -q 'temp3=' "$HISTORY"; then
+  printf '%s\n' 'graph history kept invalid temp3 reading' >&2
+  exit 1
+fi
 
 printf '%s\n' 2600 > "$HWMON/fan2_input"
 printf '%s\n' 2100 > "$HWMON/fan3_input"
 printf '%s\n' 53000 > "$HWMON/temp1_input"
 printf '%s\n' 39000 > "$HWMON/temp2_input"
+printf '%s\n' -128000 > "$HWMON/temp3_input"
 export UGREEN_FAN_NOW=86501
 "$ROOT_DIR/fan" graph collect >/dev/null
 if grep -q '^100	' "$HISTORY"; then

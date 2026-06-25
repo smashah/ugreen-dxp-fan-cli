@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- Fix one-line installer warning when run through `curl | bash`.
+- Restart the auto service during install so upgrades reapply the curve even when the oneshot is already active.
+- Skip clearly invalid graph temperature readings such as disconnected `-128c` sensors.
+
 ## 0.2.0
 
 - Add `fan graph` terminal history view.
