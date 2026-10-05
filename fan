@@ -6,7 +6,9 @@ DEFAULT_CONFIG_FILE="/etc/ugreen-fan.conf"
 CONFIG_FILE="${UGREEN_FAN_CONFIG:-$DEFAULT_CONFIG_FILE}"
 LOCK_FILE="${UGREEN_FAN_LOCK:-/run/ugreen-fan.lock}"
 DEFAULT_TARGET_C=35
-DEFAULT_CHANNELS="pwm2 pwm3"
+DEFAULT_CHANNELS="auto"
+IT8613_CHANNELS="pwm2 pwm3"
+IT5571_CHANNELS="pwm1 pwm2 pwm3 pwm4"
 DEFAULT_HISTORY_FILE="/var/lib/ugreen-fan/history.tsv"
 DEFAULT_GRAPH_ENABLED=1
 DEFAULT_GRAPH_INTERVAL_SEC=10
@@ -33,8 +35,8 @@ Usage:
   fan graph interval 30
 
 Modes:
-  auto        Apply the saved hardware auto fan curve.
-  35c         Save 35C as the auto target and apply the curve.
+  auto        Apply the saved hardware auto fan curve (it5571: EC firmware curve).
+  35c         Save 35C as the auto target and apply the curve (it5571: saved only).
   full|max    Run fans at full speed.
   255         Set a raw manual PWM value from 0 to 255.
   50%         Set a manual percentage from 0% to 100%.
@@ -44,7 +46,9 @@ Modes:
 Config:
   /etc/ugreen-fan.conf
 
-Defaults target the UGREEN DXP4800 Plus IT8613E fan channels: pwm2 pwm3.
+CHANNELS=auto picks the fan channels for the detected chip:
+  it8613/it87 (DXP4800 Plus)  pwm2 pwm3
+  it5571 (iDX6011 Pro EC)     pwm1 pwm2 pwm3 pwm4
 EOF
 }
 
@@ -70,6 +74,8 @@ load_config() {
   fi
 
   HISTORY_FILE="${UGREEN_FAN_HISTORY:-$HISTORY_FILE}"
+  # CONFIG_CHANNELS is what gets saved; CHANNELS may be resolved from auto.
+  CONFIG_CHANNELS="$CHANNELS"
 
   validate_target "$AUTO_TARGET_C"
   validate_channels "$CHANNELS"
@@ -94,7 +100,7 @@ save_config_all() {
     printf '%s\n' '# UGREEN DXP fan CLI config'
     printf '%s\n' "# AUTO_TARGET_C is used by 'fan auto' and ugreen-fan-auto.service at boot."
     printf 'AUTO_TARGET_C=%s\n' "$AUTO_TARGET_C"
-    printf 'CHANNELS=%q\n' "$CHANNELS"
+    printf 'CHANNELS=%q\n' "$CONFIG_CHANNELS"
     printf '%s\n' "# Graph history is collected by ugreen-fan-graph.timer."
     printf 'GRAPH_ENABLED=%s\n' "$GRAPH_ENABLED"
     printf 'GRAPH_INTERVAL_SEC=%s\n' "$GRAPH_INTERVAL_SEC"
@@ -127,6 +133,7 @@ validate_channels() {
   local channel
 
   [ -n "$channels" ] || die "CHANNELS cannot be empty"
+  [ "$channels" = "auto" ] && return 0
   for channel in $channels; do
     case "$channel" in
       pwm[0-9]*) ;;
@@ -183,7 +190,7 @@ find_hwmon_once() {
     [ -f "$dir/name" ] || continue
     name="$(cat "$dir/name" 2>/dev/null || true)"
     case "$name" in
-      it8613|it8613-*|it87)
+      it8613|it8613-*|it87|it5571)
         printf '%s\n' "$dir"
         return 0
         ;;
@@ -211,7 +218,37 @@ find_hwmon() {
   done
 
   now="$(date +%H:%M:%S 2>/dev/null || true)"
-  die "could not find IT8613E hwmon device at $now. Is the it87 module installed and loaded?"
+  die "could not find an it8613 or it5571 hwmon device at $now. Is the it87 module installed and loaded?"
+}
+
+# Sets CHIP from the hwmon name and resolves CHANNELS=auto for that chip.
+resolve_chip() {
+  local hwmon="$1"
+
+  CHIP="$(read_attr "$hwmon/name")"
+  [ "$CHANNELS" = "auto" ] || return 0
+  case "$CHIP" in
+    it5571) CHANNELS="$IT5571_CHANNELS" ;;
+    *) CHANNELS="$IT8613_CHANNELS" ;;
+  esac
+}
+
+# The iDX6011 Pro EC has no full-speed mode or programmable curve.
+is_ec_chip() {
+  [ "${CHIP:-}" = "it5571" ]
+}
+
+# Hands every channel back to the EC firmware curve (pwm_enable=2).
+# Attempts all channels before failing so one EC timeout cannot strand the rest.
+release_to_ec() {
+  local hwmon="$1"
+  local channel failed=""
+
+  warn "it5571 EC runs its own firmware curve; AUTO_TARGET_C is not applied on this chip"
+  for channel in $CHANNELS; do
+    printf '%s\n' 2 > "$hwmon/${channel}_enable" || failed="$failed $channel"
+  done
+  [ -z "$failed" ] || die "could not return to EC auto mode:$failed"
 }
 
 read_attr() {
@@ -220,7 +257,7 @@ read_attr() {
     printf '?'
     return 0
   }
-  tr -d '\n' < "$path"
+  tr -d '\n' < "$path" 2>/dev/null || printf '?'
 }
 
 write_attr() {
@@ -528,6 +565,7 @@ handle_graph() {
       ;;
     collect)
       hwmon="$(find_hwmon)"
+      resolve_chip "$hwmon"
       collect_graph_sample "$hwmon"
       ;;
     on|enable)
@@ -582,6 +620,10 @@ status() {
   for channel in $CHANNELS; do
     enable="$(read_attr "$hwmon/${channel}_enable")"
     pwm="$(read_attr "$hwmon/$channel")"
+    # In EC auto mode the it5571 duty register holds the last manual value.
+    if is_ec_chip && [ "$enable" = "2" ]; then
+      pwm="-"
+    fi
     fan_num="${channel#pwm}"
     fan_input="$hwmon/fan${fan_num}_input"
     printf '%-8s %-7s %-7s %-8s\n' "$channel" "$enable" "$pwm" "$(read_attr "$fan_input")"
@@ -605,8 +647,13 @@ apply_full() {
   require_root_for_write
   check_channels_exist "$hwmon"
   for channel in $CHANNELS; do
-    # For the it87 driver, pwm_enable=0 is full-speed mode.
-    write_attr "$hwmon/${channel}_enable" 0
+    if is_ec_chip; then
+      write_attr "$hwmon/${channel}_enable" 1
+      write_attr "$hwmon/$channel" 255
+    else
+      # For the it87 driver, pwm_enable=0 is full-speed mode.
+      write_attr "$hwmon/${channel}_enable" 0
+    fi
   done
 }
 
@@ -652,6 +699,11 @@ apply_auto() {
   validate_target "$target_c"
   require_root_for_write
   check_channels_exist "$hwmon"
+
+  if is_ec_chip; then
+    release_to_ec "$hwmon"
+    return 0
+  fi
 
   cpu_point1=$(((target_c - 5) * 1000))
   cpu_point2=$((target_c * 1000))
@@ -721,6 +773,7 @@ main() {
   done
 
   hwmon="$(find_hwmon)"
+  resolve_chip "$hwmon"
 
   case "$command" in
     status|"")

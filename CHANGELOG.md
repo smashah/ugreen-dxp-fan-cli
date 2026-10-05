@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Support the UGREEN iDX6011 Pro `it5571` EC backend: detect the hwmon device, drive `pwm1`-`pwm4`, use manual PWM 255 for `full`, and hand fans back to the EC firmware curve for `auto`.
+- Add `CHANNELS=auto`, which picks fan channels for the detected chip; new installs write it by default. Older `fan` versions reject `CHANNELS=auto`, so set explicit channels before downgrading.
+- Warn during install when `ugreen-fan-control.service` is active.
+- On it5571, `fan status` shows `-` for PWM while a channel is in EC auto mode.
+- On it5571, `fan auto` attempts every channel before reporting a failed hand-back to the EC.
+
 ## 0.2.2
 
 - Add install/uninstall smoke tests that run against a temporary root with fake `systemctl`.

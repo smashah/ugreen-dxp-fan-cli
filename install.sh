@@ -167,7 +167,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 # UGREEN DXP fan CLI config
 # AUTO_TARGET_C is used by 'fan auto' and ugreen-fan-auto.service at boot.
 AUTO_TARGET_C=$TARGET_C
-CHANNELS="pwm2 pwm3"
+CHANNELS=auto
 GRAPH_ENABLED=$GRAPH_ENABLED
 GRAPH_INTERVAL_SEC=$GRAPH_INTERVAL_SEC
 HISTORY_FILE="$HISTORY_FILE"
@@ -176,7 +176,7 @@ EOF
 else
   set_config_key AUTO_TARGET_C "$TARGET_C"
   if ! grep -q '^CHANNELS=' "$CONFIG_FILE"; then
-    printf '%s\n' 'CHANNELS="pwm2 pwm3"' >> "$CONFIG_FILE"
+    printf '%s\n' 'CHANNELS=auto' >> "$CONFIG_FILE"
   fi
   set_config_key GRAPH_ENABLED "$GRAPH_ENABLED"
   set_config_key GRAPH_INTERVAL_SEC "$GRAPH_INTERVAL_SEC"
@@ -187,7 +187,7 @@ if [ "$WRITE_MODULE_CONFIG" -eq 1 ]; then
   info "Writing it87 module config"
   install -d "$MODULES_LOAD_DIR" "$MODPROBE_DIR"
   cat > "$MODULES_LOAD_DIR/it87.conf" <<'EOF'
-# Load UGREEN DXP IT8613E hwmon driver at boot.
+# Load UGREEN it87 hwmon driver (IT8613E, iDX6011 Pro ITE5571 EC) at boot.
 it87
 EOF
   cat > "$MODPROBE_DIR/it87.conf" <<'EOF'
@@ -251,6 +251,10 @@ if [ "$DISABLE_EMPTY_FANCONTROL" -eq 1 ] &&
    [ ! -s "$ETC_DIR/fancontrol" ]; then
   info "Disabling empty fancontrol.service"
   systemctl disable --now fancontrol.service >/dev/null 2>&1 || true
+fi
+
+if systemctl is-active --quiet ugreen-fan-control.service 2>/dev/null; then
+  printf '%s\n' "install.sh: warning: ugreen-fan-control.service is active and also controls these fans. To keep it in charge, run: systemctl disable ugreen-fan-auto.service (reinstalling re-enables it unless --no-enable is used)." >&2
 fi
 
 if systemctl is-active --quiet coolercontrold.service 2>/dev/null; then

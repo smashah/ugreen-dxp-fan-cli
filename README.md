@@ -1,6 +1,6 @@
 # UGREEN DXP Fan CLI
 
-Simple fan control CLI for UGREEN DXP NAS systems running Debian or Proxmox with the IT8613E `it87` hwmon driver.
+Simple fan control CLI for UGREEN DXP4800 Plus and iDX6011 Pro NAS systems running Debian or Proxmox with the UGREEN `it87` hwmon driver.
 
 This repo does not replace the kernel driver. It installs a clean `fan` command and a boot service that applies a safe hardware-auto curve by default.
 
@@ -13,9 +13,13 @@ Tested on:
 - IT8613E exposed through the out-of-tree `it87` driver
 - Fan channels `pwm2` and `pwm3`
 
+Also supported:
+
+- UGREEN iDX6011 Pro, through the `it5571` EC backend in the UGREEN `it87` driver. Fan channels `pwm1`-`pwm4` (CPU pair `pwm1`/`pwm2`, system pair `pwm3`/`pwm4`). See [iDX6011 Pro](#idx6011-pro).
+
 ## Install
 
-First install and load the UGREEN-compatible `it87` driver. The hardware should expose an `it8613` device under `/sys/class/hwmon`.
+First install and load the UGREEN-compatible `it87` driver. The hardware should expose an `it8613` (DXP4800 Plus) or `it5571` (iDX6011 Pro) device under `/sys/class/hwmon`.
 
 Then install this CLI:
 
@@ -92,6 +96,21 @@ Changing the target shifts the curve:
 
 This is intentionally conservative. On the DXP4800 Plus tested, the previous invalid/weak auto settings let the CPU package hit the thermal limit. This curve keeps hardware auto mode but gives it a more useful fan response.
 
+## iDX6011 Pro
+
+The iDX6011 Pro fans are driven by the embedded controller, which supports only manual duty and its own firmware curve:
+
+| Command | iDX6011 Pro behavior |
+| --- | --- |
+| `fan auto`, `fan 35c` | Returns all fans to the EC firmware curve (`pwmN_enable=2`). `fan 35c` saves the target, but the EC cannot use it. |
+| `fan full`, `fan max` | Manual mode at PWM 255. |
+| `fan 50%`, `fan 128` | Manual mode at that duty on every channel. |
+| `fan status` | Shows `-` for PWM on channels in EC auto mode, where the duty register holds the last manual value. |
+
+For temperature-following curves on this model, use `ugreen-fan-control.service` from [IT-Kuny/UGREEN-DXP-FAN-NAS-Driver](https://github.com/IT-Kuny/UGREEN-DXP-FAN-NAS-Driver) in a curve mode (`silent`, `quiet`, `turbo`) and keep `fan` for status and graphs. Run only one fan manager: that service writes PWM only when its computed target changes, so `fan` commands and `ugreen-fan-auto.service` at boot override it until then. Disable `ugreen-fan-auto.service` when using the curve service, and pass `--no-enable` when reinstalling `fan`.
+
+The plain iDX6011 (non-Pro, `it8622` hwmon) is not supported by `fan`.
+
 ## Services
 
 Check the boot service:
@@ -130,13 +149,13 @@ The installer disables `fancontrol.service` only when the service exists but `/e
 
 ```sh
 AUTO_TARGET_C=35
-CHANNELS="pwm2 pwm3"
+CHANNELS=auto
 GRAPH_ENABLED=1
 GRAPH_INTERVAL_SEC=10
 HISTORY_FILE="/var/lib/ugreen-fan/history.tsv"
 ```
 
-The defaults are for the DXP4800 Plus. If another UGREEN DXP model exposes different PWM channels, update `CHANNELS`.
+`CHANNELS=auto` uses `pwm2 pwm3` on `it8613` and `pwm1 pwm2 pwm3 pwm4` on `it5571`. If another UGREEN model exposes different PWM channels, set `CHANNELS` explicitly, for example `CHANNELS="pwm1 pwm2"`.
 
 ## Fan Graph
 

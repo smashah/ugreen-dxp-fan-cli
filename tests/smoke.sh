@@ -48,6 +48,9 @@ export UGREEN_FAN_SKIP_SENSORS=1
 [ "$(cat "$HWMON/pwm2_auto_point2_temp")" = "35000" ]
 [ "$(cat "$HWMON/pwm3_auto_point3_temp")" = "42000" ]
 grep -q '^AUTO_TARGET_C=35$' "$CONF"
+grep -q '^CHANNELS=auto$' "$CONF"
+it8613_status="$("$ROOT_DIR/fan" status)"
+printf '%s\n' "$it8613_status" | grep -Eq '^pwm2 +2 +128 +1900 *$'
 
 "$ROOT_DIR/fan" full >/dev/null
 [ "$(cat "$HWMON/pwm2_enable")" = "0" ]
@@ -87,5 +90,72 @@ graph_status_output="$("$ROOT_DIR/fan" graph status)"
 printf '%s\n' "$graph_status_output" | grep -q '^samples: 1$'
 graph_output="$(UGREEN_FAN_GRAPH_WIDTH=20 "$ROOT_DIR/fan" graph)"
 printf '%s\n' "$graph_output" | grep -q '^fan graph: last 24h'
+
+# iDX6011 Pro: it5571 EC exposes pwm1-4 with enable 1=manual, 2=EC auto.
+EC_HWMON="$TMP_DIR/hwmon1"
+EC_CONF="$TMP_DIR/ugreen-fan-ec.conf"
+mkdir -p "$EC_HWMON"
+printf '%s\n' it5571 > "$EC_HWMON/name"
+for n in 1 2 3 4; do
+  printf '%s\n' 2 > "$EC_HWMON/pwm${n}_enable"
+  printf '%s\n' 100 > "$EC_HWMON/pwm${n}"
+  printf '%s\n' 1500 > "$EC_HWMON/fan${n}_input"
+done
+export UGREEN_FAN_HWMON="$EC_HWMON"
+export UGREEN_FAN_CONFIG="$EC_CONF"
+
+ec_status="$("$ROOT_DIR/fan" status)"
+printf '%s\n' "$ec_status" | grep -q '^pwm4 '
+
+"$ROOT_DIR/fan" 50% >/dev/null
+for n in 1 2 3 4; do
+  [ "$(cat "$EC_HWMON/pwm${n}_enable")" = "1" ]
+  [ "$(cat "$EC_HWMON/pwm${n}")" = "128" ]
+done
+
+"$ROOT_DIR/fan" full >/dev/null
+for n in 1 2 3 4; do
+  [ "$(cat "$EC_HWMON/pwm${n}_enable")" = "1" ]
+  [ "$(cat "$EC_HWMON/pwm${n}")" = "255" ]
+done
+ec_status="$("$ROOT_DIR/fan" status)"
+printf '%s\n' "$ec_status" | grep -Eq '^pwm1 +1 +255 +1500 *$'
+
+# Sentinel curve files expose any it8613 curve programming on the EC path.
+for n in 1 2 3 4; do
+  printf '%s\n' sentinel > "$EC_HWMON/pwm${n}_auto_start"
+done
+ec_auto_err="$("$ROOT_DIR/fan" 40c 2>&1 >/dev/null)"
+printf '%s\n' "$ec_auto_err" | grep -q 'firmware curve'
+for n in 1 2 3 4; do
+  [ "$(cat "$EC_HWMON/pwm${n}_enable")" = "2" ]
+  [ "$(cat "$EC_HWMON/pwm${n}")" = "255" ]
+  [ "$(cat "$EC_HWMON/pwm${n}_auto_start")" = "sentinel" ]
+done
+ec_status="$("$ROOT_DIR/fan" status)"
+printf '%s\n' "$ec_status" | grep -Eq '^pwm1 +2 +- +1500 *$'
+rm -f "$EC_HWMON"/pwm*_auto_start
+grep -q '^AUTO_TARGET_C=40$' "$EC_CONF"
+grep -q '^CHANNELS=auto$' "$EC_CONF"
+
+# A failed hand-back on one channel still releases the others.
+"$ROOT_DIR/fan" 0% >/dev/null
+rm "$EC_HWMON/pwm2_enable"
+mkdir "$EC_HWMON/pwm2_enable"
+if "$ROOT_DIR/fan" auto >/dev/null 2>&1; then
+  printf '%s\n' 'fan auto should fail when a channel cannot be released' >&2
+  exit 1
+fi
+for n in 1 3 4; do
+  [ "$(cat "$EC_HWMON/pwm${n}_enable")" = "2" ]
+done
+rmdir "$EC_HWMON/pwm2_enable"
+printf '%s\n' 2 > "$EC_HWMON/pwm2_enable"
+
+printf 'CHANNELS="pwm1 pwm2"\n' > "$EC_CONF"
+printf '%s\n' 2 > "$EC_HWMON/pwm3_enable"
+"$ROOT_DIR/fan" 30% >/dev/null
+[ "$(cat "$EC_HWMON/pwm1_enable")" = "1" ]
+[ "$(cat "$EC_HWMON/pwm3_enable")" = "2" ]
 
 printf '%s\n' 'smoke tests passed'

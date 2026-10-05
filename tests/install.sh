@@ -18,6 +18,9 @@ printf ' %s' "$@" >> "$SYSTEMCTL_LOG"
 printf '\n' >> "$SYSTEMCTL_LOG"
 
 if [ "${1:-}" = "is-active" ] && [ "${2:-}" = "--quiet" ]; then
+  case " ${FAKE_ACTIVE_UNITS:-} " in
+    *" ${3:-} "*) exit 0 ;;
+  esac
   exit 1
 fi
 
@@ -52,6 +55,7 @@ run_env() {
   env \
     PATH="$FAKE_BIN:$PATH" \
     SYSTEMCTL_LOG="$root/systemctl.log" \
+    FAKE_ACTIVE_UNITS="${FAKE_ACTIVE_UNITS:-}" \
     FAKE_CURL_SOURCE="$ROOT_DIR/fan" \
     UGREEN_FAN_ALLOW_NONROOT=1 \
     UGREEN_FAN_PREFIX="$root/usr/local" \
@@ -100,6 +104,7 @@ assert_file "$install_root/etc/systemd/system/ugreen-fan-graph.service"
 assert_file "$install_root/etc/systemd/system/ugreen-fan-graph.timer"
 
 assert_grep '^AUTO_TARGET_C=40$' "$install_root/etc/ugreen-fan.conf"
+assert_grep '^CHANNELS=auto$' "$install_root/etc/ugreen-fan.conf"
 assert_grep '^GRAPH_ENABLED=1$' "$install_root/etc/ugreen-fan.conf"
 assert_grep '^GRAPH_INTERVAL_SEC=15$' "$install_root/etc/ugreen-fan.conf"
 assert_grep "HISTORY_FILE=\"$install_root/var/lib/ugreen-fan/history.tsv\"" "$install_root/etc/ugreen-fan.conf"
@@ -124,6 +129,28 @@ if grep -q 'systemctl restart ugreen-fan-auto.service' "$install_root/systemctl.
   printf 'install --no-start should not restart auto service\n' >&2
   exit 1
 fi
+
+# Existing configs keep explicit channels; configs without CHANNELS get auto.
+legacy_root="$TMP_DIR/legacy-root"
+mkdir -p "$legacy_root/etc"
+printf 'AUTO_TARGET_C=35\nCHANNELS="pwm2 pwm3"\n' > "$legacy_root/etc/ugreen-fan.conf"
+run_env "$legacy_root" bash "$ROOT_DIR/install.sh" --no-start >/dev/null
+assert_grep '^CHANNELS="pwm2 pwm3"$' "$legacy_root/etc/ugreen-fan.conf"
+[ "$(grep -c '^CHANNELS=' "$legacy_root/etc/ugreen-fan.conf")" -eq 1 ]
+
+nochan_root="$TMP_DIR/nochan-root"
+mkdir -p "$nochan_root/etc"
+printf 'AUTO_TARGET_C=35\n' > "$nochan_root/etc/ugreen-fan.conf"
+run_env "$nochan_root" bash "$ROOT_DIR/install.sh" --no-start >/dev/null
+assert_grep '^CHANNELS=auto$' "$nochan_root/etc/ugreen-fan.conf"
+
+warn_root="$TMP_DIR/warn-root"
+mkdir -p "$warn_root"
+warn_output="$(FAKE_ACTIVE_UNITS=ugreen-fan-control.service run_env "$warn_root" bash "$ROOT_DIR/install.sh" --no-start 2>&1 >/dev/null)"
+printf '%s\n' "$warn_output" | grep -q 'ugreen-fan-control.service is active' || {
+  printf 'missing ugreen-fan-control.service warning\n' >&2
+  exit 1
+}
 
 stdin_root="$TMP_DIR/stdin-root"
 mkdir -p "$stdin_root/work"
